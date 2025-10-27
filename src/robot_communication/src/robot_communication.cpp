@@ -11,6 +11,7 @@
 #include <tf2/convert.h>
 #include <tf2/time.h>
 #include <tf2/transform_datatypes.h>
+#include <tf2_ros/transform_broadcaster.h>  // already present
 
 #include <chrono>
 #include <cstdint>
@@ -22,6 +23,7 @@
 #include <rclcpp/serialization.hpp>
 #include <rclcpp/serialized_message.hpp>
 #include <rclcpp/utilities.hpp>
+#include <rclcpp/time.hpp>  // 添加：提供 rclcpp::Time::to_msg()
 #include <string>
 #include <tf2_eigen/tf2_eigen.hpp>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
@@ -41,10 +43,15 @@ RobotCommunicationNode::RobotCommunicationNode(
   this->declare_parameter<int>("robot_count", 3);
   this->declare_parameter<int>("network_port", 12130);
   this->declare_parameter<std::string>("network_ip", "192.168.31.207");
+  this->declare_parameter<bool>("update_timestamp_on_receive", true);
 
   this->get_parameter("robot_count", robot_count);
   this->get_parameter("network_port", port);
   this->get_parameter("network_ip", ip);
+  this->get_parameter("update_timestamp_on_receive", update_timestamp_on_receive);
+  
+  RCLCPP_INFO(this->get_logger(), "Timestamp update on receive: %s", 
+              update_timestamp_on_receive ? "enabled" : "disabled");
 
   rclcpp::QoS qos(rclcpp::KeepLast(10));
   qos.durability(rclcpp::DurabilityPolicy::TransientLocal);
@@ -71,6 +78,9 @@ RobotCommunicationNode::RobotCommunicationNode(
           WayPointCallBack(msg, i);
         });
   }
+
+  // initialize class member TransformBroadcaster
+  tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(this);
 
   InitServer();
 }
@@ -124,6 +134,18 @@ void RobotCommunicationNode::InitServer() {
 void RobotCommunicationNode::WayPointCallBack(
   const geometry_msgs::msg::PointStamped::ConstSharedPtr way_point_msg,
   const int robot_id) {
+  RCLCPP_INFO(this->get_logger(), "Sending waypoint message for robot_%d: x=%.2f, y=%.2f, z=%.2f", 
+              robot_id, way_point_msg->point.x, way_point_msg->point.y, way_point_msg->point.z);
+
+  // Remove prefix `robot_{id}/` from frame_id before sending to robot
+  geometry_msgs::msg::PointStamped msg = *way_point_msg;
+  const std::string prefix = "robot_" + std::to_string(robot_id) + "/";
+  if (!msg.header.frame_id.empty()) {
+    if (msg.header.frame_id.rfind(prefix, 0) == 0) { // starts with prefix
+      msg.header.frame_id = msg.header.frame_id.substr(prefix.size());
+    }
+  }
+
   std::vector<uint8_t> data_buffer =
     SerializeMsg<geometry_msgs::msg::PointStamped>(*way_point_msg);
   SendBuffer prepare_buffer = {robot_id, data_buffer, 0};
@@ -203,6 +225,9 @@ void RobotCommunicationNode::ParseBufferThread(const int robot_id) {
   int packet_idx = 0;
   int packet_type = -1;
   std::vector<uint8_t> buffer;
+  rclcpp::Time last_transform_time(0, 0, RCL_ROS_TIME); // Track last transform time
+  rclcpp::Time last_transform_log_time(0, 0, RCL_ROS_TIME); // Track last transform log time
+
   while (rclcpp::ok()) {
     if (recv_buffer_queue[robot_id].empty()) {
       std::this_thread::sleep_for(std::chrono::nanoseconds(10));
@@ -255,23 +280,130 @@ void RobotCommunicationNode::ParseBufferThread(const int robot_id) {
       if (type == 0) {  // PointCloud2
         sensor_msgs::msg::PointCloud2 totalRegisteredScan =
           DeserializeMsg<sensor_msgs::msg::PointCloud2>(buffer);
+        
+        // 更新时间戳为接收时间
+        if (update_timestamp_on_receive) {
+          uint64_t now_ns = this->get_clock()->now().nanoseconds();
+          totalRegisteredScan.header.stamp.sec = static_cast<uint32_t>(now_ns / 1000000000ULL);
+          totalRegisteredScan.header.stamp.nanosec = static_cast<uint32_t>(now_ns % 1000000000ULL);
+        }
+        
+        // Prefix frame_id with robot_{id}/ before publishing
+        const std::string prefix = "robot_" + std::to_string(id) + "/";
+        if (!totalRegisteredScan.header.frame_id.empty() &&
+            totalRegisteredScan.header.frame_id.rfind(prefix, 0) != 0) {
+          totalRegisteredScan.header.frame_id = prefix + totalRegisteredScan.header.frame_id;
+        }
         registered_scan_pub_[id]->publish(totalRegisteredScan);
       } else if (type == 1) {  // Realsense PointCloud2
         sensor_msgs::msg::PointCloud2 realsense_pointcloud =
           DeserializeMsg<sensor_msgs::msg::PointCloud2>(buffer);
+        
+        // 更新时间戳为接收时间
+        if (update_timestamp_on_receive) {
+          uint64_t now_ns = this->get_clock()->now().nanoseconds();
+          realsense_pointcloud.header.stamp.sec = static_cast<uint32_t>(now_ns / 1000000000ULL);
+          realsense_pointcloud.header.stamp.nanosec = static_cast<uint32_t>(now_ns % 1000000000ULL);
+        }
+        
+        const std::string prefix = "robot_" + std::to_string(id) + "/";
+        if (!realsense_pointcloud.header.frame_id.empty() &&
+            realsense_pointcloud.header.frame_id.rfind(prefix, 0) != 0) {
+          realsense_pointcloud.header.frame_id = prefix + realsense_pointcloud.header.frame_id;
+        }
         realsense_pointcloud_pub_[id]->publish(realsense_pointcloud);
       } else if (type == 2) {  // Transform
         geometry_msgs::msg::TransformStamped transformStamped =
           DeserializeMsg<geometry_msgs::msg::TransformStamped>(buffer);
-        tf2_ros::TransformBroadcaster tf_broadcaster_ = this;
-        tf_broadcaster_.sendTransform(transformStamped);
+
+        // 更新时间戳为接收时间（如果启用）
+        if (update_timestamp_on_receive || 
+            (transformStamped.header.stamp.sec == 0 && transformStamped.header.stamp.nanosec == 0)) {
+          uint64_t now_ns = this->get_clock()->now().nanoseconds();
+          transformStamped.header.stamp.sec = static_cast<uint32_t>(now_ns / 1000000000ULL);
+          transformStamped.header.stamp.nanosec = static_cast<uint32_t>(now_ns % 1000000000ULL);
+          if (!update_timestamp_on_receive) {
+            RCLCPP_WARN(this->get_logger(),
+                        "TransformStamped received without timestamp, adding current time");
+          }
+        }
+
+        // 可选：如果 frame_id 或 child_frame_id 为空，记录警告（便于排查）
+        if (transformStamped.header.frame_id.empty() ||
+            transformStamped.child_frame_id.empty()) {
+          RCLCPP_WARN(this->get_logger(),
+                      "Received TransformStamped with empty frame ids (parent='%s', child='%s')",
+                      transformStamped.header.frame_id.c_str(),
+                      transformStamped.child_frame_id.c_str());
+        }
+
+        // Prefix parent/child frames with robot_{id}/ before broadcasting TF
+        const std::string prefix = "robot_" + std::to_string(id) + "/";
+        if (!transformStamped.header.frame_id.empty() &&
+            transformStamped.header.frame_id.rfind(prefix, 0) != 0) {
+          transformStamped.header.frame_id = prefix + transformStamped.header.frame_id;
+        }
+        if (!transformStamped.child_frame_id.empty() &&
+            transformStamped.child_frame_id.rfind(prefix, 0) != 0) {
+          transformStamped.child_frame_id = prefix + transformStamped.child_frame_id;
+        }
+
+        // 提高发送频率：检查是否超过阈值时间间隔（5Hz = 0.2秒）
+        rclcpp::Time now = this->get_clock()->now();
+        if ((now - last_transform_time).seconds() >= 0.2) {
+          if (tf_broadcaster_) {
+            tf_broadcaster_->sendTransform(transformStamped);
+            
+            // 降低日志输出频率到 0.5Hz（2秒间隔）
+            if ((now - last_transform_log_time).seconds() >= 2.0) {
+              RCLCPP_INFO(this->get_logger(),
+                          "Sent transform (robot id=%u) parent='%s' child='%s' time=%u.%u",
+                          id,
+                          transformStamped.header.frame_id.c_str(),
+                          transformStamped.child_frame_id.c_str(),
+                          transformStamped.header.stamp.sec,
+                          transformStamped.header.stamp.nanosec);
+              last_transform_log_time = now;
+            }
+          } else {
+            RCLCPP_WARN(this->get_logger(), "tf_broadcaster_ is not initialized");
+          }
+          last_transform_time = now;
+        }
       } else if (type == 3) {
         nav_msgs::msg::OccupancyGrid map =
           DeserializeMsg<nav_msgs::msg::OccupancyGrid>(buffer);
+        
+        // 更新时间戳为接收时间
+        if (update_timestamp_on_receive) {
+          uint64_t now_ns = this->get_clock()->now().nanoseconds();
+          map.header.stamp.sec = static_cast<uint32_t>(now_ns / 1000000000ULL);
+          map.header.stamp.nanosec = static_cast<uint32_t>(now_ns % 1000000000ULL);
+        }
+        
+        const std::string prefix = "robot_" + std::to_string(id) + "/";
+        if (!map.header.frame_id.empty() &&
+            map.header.frame_id.rfind(prefix, 0) != 0) {
+          map.header.frame_id = prefix + map.header.frame_id;
+        }
         map_pub_[id]->publish(map);
+        RCLCPP_INFO(this->get_logger(), "Received and published map for robot_%u", id);
       } else if (type == 4) {
         sensor_msgs::msg::Image image =
           DeserializeMsg<sensor_msgs::msg::Image>(buffer);
+        
+        // 更新时间戳为接收时间
+        if (update_timestamp_on_receive) {
+          uint64_t now_ns = this->get_clock()->now().nanoseconds();
+          image.header.stamp.sec = static_cast<uint32_t>(now_ns / 1000000000ULL);
+          image.header.stamp.nanosec = static_cast<uint32_t>(now_ns % 1000000000ULL);
+        }
+        
+        const std::string prefix = "robot_" + std::to_string(id) + "/";
+        if (!image.header.frame_id.empty() &&
+            image.header.frame_id.rfind(prefix, 0) != 0) {
+          image.header.frame_id = prefix + image.header.frame_id;
+        }
         image_pub_[id]->publish(image);
       }
     } catch (...) {

@@ -25,8 +25,8 @@ class ExploredAreaNode : public rclcpp::Node {
   int robot_count = 3;
   int exploredAreaDisplayCount = 0;
   int exploredAreaDisplayInterval = 1;
-  double exploredVolumeVoxelSize = 0.1;
-  double exploredAreaVoxelSize = 0.1;
+  double exploredVolumeVoxelSize = 0.05;
+  double exploredAreaVoxelSize = 0.05;
   float exploredVolume = 0;
   float travelingDis = 0;
 

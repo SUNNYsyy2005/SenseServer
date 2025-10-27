@@ -12,6 +12,7 @@
 #include <geometry_msgs/msg/point_stamped.hpp>
 
 #include <memory>
+#include <tf2_ros/transform_broadcaster.h>  // 添加：TransformBroadcaster 声明
 #include <pcl/impl/point_types.hpp>
 #include <queue>
 #include <rclcpp/node.hpp>
@@ -19,6 +20,7 @@
 #include <rclcpp/qos_event.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <thread>
+#include <tf2_ros/transform_broadcaster.h>
 
 #include "geometry_msgs/msg/transform_stamped.hpp"
 #include "nav_msgs/msg/odometry.hpp"
@@ -45,6 +47,7 @@ class RobotCommunicationNode : public rclcpp::Node {
   struct sockaddr_in server_addr, saved_client_addr[MAX_ROBOT_COUNT];
 
   int robot_count = 3;
+  bool update_timestamp_on_receive = true;  // 控制是否将接收消息的时间戳更新为接收时间
 
   std::thread send_thread_;
   std::thread recv_thread_;
@@ -85,6 +88,9 @@ class RobotCommunicationNode : public rclcpp::Node {
 
   rclcpp::Subscription<geometry_msgs::msg::PointStamped>::SharedPtr
     way_point_sub_[MAX_ROBOT_COUNT];
+
+  // 用于发送接收到的 transform
+  std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
 };
 }  // namespace robot_communication
 
