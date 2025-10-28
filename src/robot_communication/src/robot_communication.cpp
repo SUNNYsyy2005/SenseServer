@@ -137,17 +137,12 @@ void RobotCommunicationNode::WayPointCallBack(
   RCLCPP_INFO(this->get_logger(), "Sending waypoint message for robot_%d: x=%.2f, y=%.2f, z=%.2f", 
               robot_id, way_point_msg->point.x, way_point_msg->point.y, way_point_msg->point.z);
 
-  // Remove prefix `robot_{id}/` from frame_id before sending to robot
+  // Create a copy and force frame_id to be "map"
   geometry_msgs::msg::PointStamped msg = *way_point_msg;
-  const std::string prefix = "robot_" + std::to_string(robot_id) + "/";
-  if (!msg.header.frame_id.empty()) {
-    if (msg.header.frame_id.rfind(prefix, 0) == 0) { // starts with prefix
-      msg.header.frame_id = msg.header.frame_id.substr(prefix.size());
-    }
-  }
+  msg.header.frame_id = "map";
 
   std::vector<uint8_t> data_buffer =
-    SerializeMsg<geometry_msgs::msg::PointStamped>(*way_point_msg);
+    SerializeMsg<geometry_msgs::msg::PointStamped>(msg);
   SendBuffer prepare_buffer = {robot_id, data_buffer, 0};
   PrepareBuffer(prepare_buffer);
 }
