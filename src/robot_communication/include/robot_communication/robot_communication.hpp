@@ -31,6 +31,8 @@
 #include "tf2_ros/transform_broadcaster.h"
 #include "tf2_ros/transform_listener.h"
 #include "nav_msgs/msg/occupancy_grid.hpp"
+#include "nav_msgs/msg/path.hpp"
+#include "std_msgs/msg/int8.hpp"
 
 #define MAX_ROBOT_COUNT 5
 
@@ -85,12 +87,20 @@ class RobotCommunicationNode : public rclcpp::Node {
     map_pub_[MAX_ROBOT_COUNT];
   rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr
     image_pub_[MAX_ROBOT_COUNT];
+  rclcpp::Publisher<std_msgs::msg::Int8>::SharedPtr
+    nav2_status_pub_[MAX_ROBOT_COUNT];
+  rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr
+    nav2_path_pub_[MAX_ROBOT_COUNT];
 
   rclcpp::Subscription<geometry_msgs::msg::PointStamped>::SharedPtr
     way_point_sub_[MAX_ROBOT_COUNT];
 
   // 用于发送接收到的 transform
   std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
+
+  // 地图增量传输相关
+  nav_msgs::msg::OccupancyGrid cached_maps_[MAX_ROBOT_COUNT];  // 缓存的完整地图
+  bool map_initialized_[MAX_ROBOT_COUNT] = {false};            // 地图是否已初始化
 };
 }  // namespace robot_communication
 

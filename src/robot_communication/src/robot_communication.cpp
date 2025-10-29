@@ -71,6 +71,12 @@ RobotCommunicationNode::RobotCommunicationNode(
     image_pub_[i] =
       this->create_publisher<sensor_msgs::msg::Image>(
         "/robot_" + std::to_string(i) + "/image_raw", 5);
+    nav2_status_pub_[i] =
+      this->create_publisher<std_msgs::msg::Int8>(
+        "/robot_" + std::to_string(i) + "/nav2_status", 5);
+    nav2_path_pub_[i] =
+      this->create_publisher<nav_msgs::msg::Path>(
+        "/robot_" + std::to_string(i) + "/nav2_path", 5);
     way_point_sub_[i] =
       this->create_subscription<geometry_msgs::msg::PointStamped>(
         "/robot_" + std::to_string(i) + "/way_point", 2,
@@ -381,8 +387,66 @@ void RobotCommunicationNode::ParseBufferThread(const int robot_id) {
             map.header.frame_id.rfind(prefix, 0) != 0) {
           map.header.frame_id = prefix + map.header.frame_id;
         }
-        map_pub_[id]->publish(map);
-        RCLCPP_INFO(this->get_logger(), "Received and published map for robot_%u", id);
+        
+        // 检查是否为增量地图（width为负数表示增量地图）
+        if (map.info.width < 0) {
+          // 这是增量地图
+          int32_t num_changes = -map.info.width;
+          
+          if (!map_initialized_[id]) {
+            RCLCPP_WARN(this->get_logger(), 
+                        "Received delta map for robot_%u but no base map exists, ignoring", id);
+            packet_idx = 0;
+            packet_type = -1;
+            buffer = std::vector<uint8_t>(0);
+            continue;
+          }
+          
+          // 恢复正确的宽度
+          map.info.width = cached_maps_[id].info.width;
+          
+          // 解析增量数据并应用到缓存的地图
+          nav_msgs::msg::OccupancyGrid updated_map = cached_maps_[id];
+          updated_map.header = map.header;  // 更新时间戳
+          
+          size_t data_idx = 0;
+          int changes_applied = 0;
+          while (data_idx + 4 < map.data.size()) {
+            // 读取 4 字节索引
+            int32_t idx = static_cast<int32_t>(
+              static_cast<uint8_t>(map.data[data_idx]) |
+              (static_cast<uint8_t>(map.data[data_idx + 1]) << 8) |
+              (static_cast<uint8_t>(map.data[data_idx + 2]) << 16) |
+              (static_cast<uint8_t>(map.data[data_idx + 3]) << 24)
+            );
+            int8_t value = map.data[data_idx + 4];
+            
+            if (idx >= 0 && idx < static_cast<int32_t>(updated_map.data.size())) {
+              updated_map.data[idx] = value;
+              changes_applied++;
+            }
+            
+            data_idx += 5;
+          }
+          
+          RCLCPP_INFO(this->get_logger(), 
+                      "Applied %d delta changes to robot_%u map (expected %d)",
+                      changes_applied, id, num_changes);
+          
+          // 更新缓存并发布
+          cached_maps_[id] = updated_map;
+          map_pub_[id]->publish(updated_map);
+          
+        } else {
+          // 这是完整地图
+          RCLCPP_INFO(this->get_logger(), 
+                      "Received and published full map for robot_%u (size: %dx%d)",
+                      id, map.info.width, map.info.height);
+          
+          cached_maps_[id] = map;
+          map_initialized_[id] = true;
+          map_pub_[id]->publish(map);
+        }
       } else if (type == 4) {
         sensor_msgs::msg::Image image =
           DeserializeMsg<sensor_msgs::msg::Image>(buffer);
@@ -400,6 +464,42 @@ void RobotCommunicationNode::ParseBufferThread(const int robot_id) {
           image.header.frame_id = prefix + image.header.frame_id;
         }
         image_pub_[id]->publish(image);
+      } else if (type == 5) {  // Nav2 Status
+        std_msgs::msg::Int8 nav2_status =
+          DeserializeMsg<std_msgs::msg::Int8>(buffer);
+        
+        nav2_status_pub_[id]->publish(nav2_status);
+        
+        const char* status_names[] = {"UNKNOWN", "ACCEPTED", "EXECUTING", "CANCELING", 
+                                      "SUCCEEDED", "CANCELED", "ABORTED"};
+        int8_t status = nav2_status.data;
+        if (status >= 0 && status <= 6) {
+          RCLCPP_INFO(this->get_logger(), 
+                      "Received Nav2 status for robot_%u: %s (%d)",
+                      id, status_names[status], status);
+        }
+      } else if (type == 6) {  // Nav2 Path
+        nav_msgs::msg::Path nav2_path =
+          DeserializeMsg<nav_msgs::msg::Path>(buffer);
+        
+        // 更新时间戳为接收时间
+        if (update_timestamp_on_receive) {
+          uint64_t now_ns = this->get_clock()->now().nanoseconds();
+          nav2_path.header.stamp.sec = static_cast<uint32_t>(now_ns / 1000000000ULL);
+          nav2_path.header.stamp.nanosec = static_cast<uint32_t>(now_ns % 1000000000ULL);
+        }
+        
+        // Prefix frame_id
+        const std::string prefix = "robot_" + std::to_string(id) + "/";
+        if (!nav2_path.header.frame_id.empty() &&
+            nav2_path.header.frame_id.rfind(prefix, 0) != 0) {
+          nav2_path.header.frame_id = prefix + nav2_path.header.frame_id;
+        }
+        
+        nav2_path_pub_[id]->publish(nav2_path);
+        RCLCPP_INFO(this->get_logger(), 
+                    "Received and published Nav2 path for robot_%u (%zu poses)",
+                    id, nav2_path.poses.size());
       }
     } catch (...) {
     }
