@@ -13,6 +13,7 @@
 #include <tf2/transform_datatypes.h>
 #include <tf2_ros/transform_broadcaster.h>  // already present
 
+#include <cerrno>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
@@ -58,7 +59,7 @@ RobotCommunicationNode::RobotCommunicationNode(
   qos.reliability(rclcpp::ReliabilityPolicy::Reliable);
   qos.history(rclcpp::HistoryPolicy::KeepLast);
 
-  for (int i = 0; i < robot_count; i++) {
+  for (int i = 1; i <= robot_count; i++) {
     registered_scan_pub_[i] =
       this->create_publisher<sensor_msgs::msg::PointCloud2>(
         "/robot_" + std::to_string(i) + "/total_registered_scan", 5);
@@ -98,7 +99,7 @@ RobotCommunicationNode::~RobotCommunicationNode() {
   if (recv_thread_.joinable()) {
     recv_thread_.join();
   }
-  for (int i = 0; i < robot_count; i++) {
+  for (int i = 1; i <= robot_count; i++) {
     if (parse_buffer_thread_[i].joinable()) {
       parse_buffer_thread_[i].join();
     }
@@ -128,7 +129,7 @@ void RobotCommunicationNode::InitServer() {
   }
 
   send_thread_ = std::thread(&RobotCommunicationNode::NetworkSendThread, this);
-  for (int i = 0; i < robot_count; i++) {
+  for (int i = 1; i <= robot_count; i++) {
     parse_buffer_thread_[i] =
       std::thread(&RobotCommunicationNode::ParseBufferThread, this, i);
   }
@@ -143,6 +144,11 @@ void RobotCommunicationNode::WayPointCallBack(
   RCLCPP_INFO(this->get_logger(), "Sending waypoint message for robot_%d: x=%.2f, y=%.2f, z=%.2f", 
               robot_id, way_point_msg->point.x, way_point_msg->point.y, way_point_msg->point.z);
 
+  // Check if we have a saved address for this robot
+  if (saved_client_addr[robot_id].sin_addr.s_addr == 0) {
+    RCLCPP_WARN(this->get_logger(), "No saved address for robot_%d yet, waypoint will be queued but not sent until robot connects", robot_id);
+  }
+
   // Create a copy and force frame_id to be "map"
   geometry_msgs::msg::PointStamped msg = *way_point_msg;
   msg.header.frame_id = "map";
@@ -151,6 +157,9 @@ void RobotCommunicationNode::WayPointCallBack(
     SerializeMsg<geometry_msgs::msg::PointStamped>(msg);
   SendBuffer prepare_buffer = {robot_id, data_buffer, 0};
   PrepareBuffer(prepare_buffer);
+  
+  RCLCPP_INFO(this->get_logger(), "Waypoint for robot_%d queued (buffer size: %zu bytes)", 
+              robot_id, data_buffer.size());
 }
 
 void RobotCommunicationNode::NetworkSendThread() {
@@ -162,12 +171,25 @@ void RobotCommunicationNode::NetworkSendThread() {
     SendBuffer s_buffer = send_buffer_queue.front();
     send_buffer_queue.pop();
     if (saved_client_addr[s_buffer.id].sin_addr.s_addr == 0) {
+      RCLCPP_WARN(this->get_logger(), "No saved address for robot_%d, skipping send", s_buffer.id);
       continue;
     }
-    if (sendto(sockfd, s_buffer.buffer.data(), s_buffer.buffer.size(), 0,
+    
+    // Log the target address
+    char addr_str[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &(saved_client_addr[s_buffer.id].sin_addr), addr_str, INET_ADDRSTRLEN);
+    uint16_t target_port = ntohs(saved_client_addr[s_buffer.id].sin_port);
+    RCLCPP_DEBUG(this->get_logger(), "Sending to robot_%d at %s:%d, buffer size: %zu", 
+                s_buffer.id, addr_str, target_port, s_buffer.buffer.size());
+    
+    ssize_t sent = sendto(sockfd, s_buffer.buffer.data(), s_buffer.buffer.size(), 0,
                (const struct sockaddr *)&saved_client_addr[s_buffer.id],
-               sizeof(saved_client_addr[s_buffer.id])) < 0) {
-      RCLCPP_ERROR(this->get_logger(), "Send failed!");
+               sizeof(saved_client_addr[s_buffer.id]));
+    if (sent < 0) {
+      RCLCPP_ERROR(this->get_logger(), "Send failed for robot_%d! errno: %d (%s)", 
+                   s_buffer.id, errno, strerror(errno));
+    } else {
+      RCLCPP_DEBUG(this->get_logger(), "Successfully sent %zd bytes to robot_%d", sent, s_buffer.id);
     }
   }
 }
@@ -187,6 +209,17 @@ void RobotCommunicationNode::NetworkRecvThread() {
 
     uint8_t id;
     std::memcpy(&id, buffer_tmp.data(), sizeof(id));
+    
+    // Log when we receive from a new robot or update existing address
+    char addr_str[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &(client_addr.sin_addr), addr_str, INET_ADDRSTRLEN);
+    uint16_t source_port = ntohs(client_addr.sin_port);
+    
+    if (saved_client_addr[id].sin_addr.s_addr == 0) {
+      RCLCPP_INFO(this->get_logger(), "First packet from robot_%d at %s:%d", 
+                  id, addr_str, source_port);
+    }
+    
     saved_client_addr[id] = client_addr;
     if (recv_buffer_queue[id].size() >= MAX_BUFFER_QUEUE_SIZE) {
       continue;
