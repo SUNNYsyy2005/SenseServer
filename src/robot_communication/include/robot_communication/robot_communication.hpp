@@ -101,6 +101,11 @@ class RobotCommunicationNode : public rclcpp::Node {
   // 地图增量传输相关
   nav_msgs::msg::OccupancyGrid cached_maps_[MAX_ROBOT_COUNT];  // 缓存的完整地图
   bool map_initialized_[MAX_ROBOT_COUNT] = {false};            // 地图是否已初始化
+  
+  // 导航状态缓存和定时发布
+  std_msgs::msg::Int8 cached_nav_status_[MAX_ROBOT_COUNT];     // 缓存的导航状态
+  rclcpp::TimerBase::SharedPtr status_publish_timer_;          // 定时发布器
+  void PublishCachedStatusCallback();                          // 定时发布回调
 };
 }  // namespace robot_communication
 

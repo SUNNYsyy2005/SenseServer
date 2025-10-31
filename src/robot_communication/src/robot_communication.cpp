@@ -89,6 +89,16 @@ RobotCommunicationNode::RobotCommunicationNode(
   // initialize class member TransformBroadcaster
   tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(this);
 
+  // 初始化缓存的导航状态（所有机器人初始化为 UNKNOWN）
+  for (int i = 0; i < MAX_ROBOT_COUNT; i++) {
+    cached_nav_status_[i].data = 0;  // UNKNOWN
+  }
+
+  // 创建定时器，以 5Hz (0.2秒) 频率发布缓存的导航状态
+  status_publish_timer_ = this->create_wall_timer(
+    std::chrono::milliseconds(200),
+    std::bind(&RobotCommunicationNode::PublishCachedStatusCallback, this));
+
   InitServer();
 }
 
@@ -209,17 +219,6 @@ void RobotCommunicationNode::NetworkRecvThread() {
 
     uint8_t id;
     std::memcpy(&id, buffer_tmp.data(), sizeof(id));
-    
-    // Log when we receive from a new robot or update existing address
-    char addr_str[INET_ADDRSTRLEN];
-    inet_ntop(AF_INET, &(client_addr.sin_addr), addr_str, INET_ADDRSTRLEN);
-    uint16_t source_port = ntohs(client_addr.sin_port);
-    
-    if (saved_client_addr[id].sin_addr.s_addr == 0) {
-      RCLCPP_INFO(this->get_logger(), "First packet from robot_%d at %s:%d", 
-                  id, addr_str, source_port);
-    }
-    
     saved_client_addr[id] = client_addr;
     if (recv_buffer_queue[id].size() >= MAX_BUFFER_QUEUE_SIZE) {
       continue;
@@ -421,10 +420,11 @@ void RobotCommunicationNode::ParseBufferThread(const int robot_id) {
           map.header.frame_id = prefix + map.header.frame_id;
         }
         
-        // 检查是否为增量地图（width为负数表示增量地图）
-        if (map.info.width < 0) {
+        // 检查是否为增量地图（width的最高位为1表示这是负数，即增量地图）
+        int32_t signed_width = static_cast<int32_t>(map.info.width);
+        if (signed_width < 0) {
           // 这是增量地图
-          int32_t num_changes = -map.info.width;
+          int32_t num_changes = -signed_width;
           
           if (!map_initialized_[id]) {
             RCLCPP_WARN(this->get_logger(), 
@@ -435,8 +435,10 @@ void RobotCommunicationNode::ParseBufferThread(const int robot_id) {
             continue;
           }
           
-          // 恢复正确的宽度
-          map.info.width = cached_maps_[id].info.width;
+          // 从height字段恢复原始宽度，从缓存恢复高度
+          uint32_t original_width = map.info.height;  // 客户端临时存储在height中
+          map.info.width = original_width;
+          map.info.height = cached_maps_[id].info.height;
           
           // 解析增量数据并应用到缓存的地图
           nav_msgs::msg::OccupancyGrid updated_map = cached_maps_[id];
@@ -501,14 +503,15 @@ void RobotCommunicationNode::ParseBufferThread(const int robot_id) {
         std_msgs::msg::Int8 nav2_status =
           DeserializeMsg<std_msgs::msg::Int8>(buffer);
         
-        nav2_status_pub_[id]->publish(nav2_status);
+        // 只更新缓存，不立即发布，由定时器统一发布
+        cached_nav_status_[id] = nav2_status;
         
         const char* status_names[] = {"UNKNOWN", "ACCEPTED", "EXECUTING", "CANCELING", 
                                       "SUCCEEDED", "CANCELED", "ABORTED"};
         int8_t status = nav2_status.data;
         if (status >= 0 && status <= 6) {
           RCLCPP_INFO(this->get_logger(), 
-                      "Received Nav2 status for robot_%u: %s (%d)",
+                      "Updated cached status for robot_%u: %s (%d)",
                       id, status_names[status], status);
         }
       } else if (type == 6) {  // Nav2 Path
@@ -574,6 +577,14 @@ T RobotCommunicationNode::DeserializeMsg(const std::vector<uint8_t> &data) {
 
   return msg;
 }
+
+// 定时发布缓存的导航状态
+void RobotCommunicationNode::PublishCachedStatusCallback() {
+  for (int i = 1; i <= robot_count; i++) {
+    nav2_status_pub_[i]->publish(cached_nav_status_[i]);
+  }
+}
+
 }  // namespace robot_communication
 
 #include "rclcpp_components/register_node_macro.hpp"
