@@ -99,6 +99,11 @@ RobotCommunicationNode::RobotCommunicationNode(
     std::chrono::milliseconds(200),
     std::bind(&RobotCommunicationNode::PublishCachedStatusCallback, this));
 
+  // 创建目标点重传定时器
+  waypoint_resend_timer_ = this->create_wall_timer(
+    std::chrono::milliseconds(WAYPOINT_RESEND_INTERVAL_MS),
+    std::bind(&RobotCommunicationNode::WaypointResendCallback, this));
+
   InitServer();
 }
 
@@ -151,35 +156,83 @@ void RobotCommunicationNode::InitServer() {
 void RobotCommunicationNode::WayPointCallBack(
   const geometry_msgs::msg::PointStamped::ConstSharedPtr way_point_msg,
   const int robot_id) {
-  RCLCPP_INFO(this->get_logger(), "Sending waypoint message for robot_%d: x=%.2f, y=%.2f, z=%.2f", 
-              robot_id, way_point_msg->point.x, way_point_msg->point.y, way_point_msg->point.z);
+  // 记录接收到新目标点
+  RCLCPP_INFO(this->get_logger(), 
+              "========================================");
+  RCLCPP_INFO(this->get_logger(), 
+              "🎯 NEW WAYPOINT RECEIVED for robot_%d", robot_id);
+  RCLCPP_INFO(this->get_logger(), 
+              "   Position: (%.3f, %.3f, %.3f)", 
+              way_point_msg->point.x, 
+              way_point_msg->point.y, 
+              way_point_msg->point.z);
+  RCLCPP_INFO(this->get_logger(), 
+              "   Frame: %s -> map (auto-converted)", 
+              way_point_msg->header.frame_id.c_str());
 
   // Check if we have a saved address for this robot
   if (saved_client_addr[robot_id].sin_addr.s_addr == 0) {
-    RCLCPP_WARN(this->get_logger(), "No saved address for robot_%d yet, waypoint will be queued but not sent until robot connects", robot_id);
+    RCLCPP_WARN(this->get_logger(), 
+                "   ⚠️  Robot_%d not connected yet, waypoint cached for later delivery", 
+                robot_id);
+  } else {
+    // 记录目标客户端地址
+    char addr_str[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &(saved_client_addr[robot_id].sin_addr), addr_str, INET_ADDRSTRLEN);
+    uint16_t target_port = ntohs(saved_client_addr[robot_id].sin_port);
+    RCLCPP_INFO(this->get_logger(), 
+                "   📡 Target: %s:%u", addr_str, target_port);
   }
 
   // Create a copy and force frame_id to be "map"
   geometry_msgs::msg::PointStamped msg = *way_point_msg;
   msg.header.frame_id = "map";
 
+  // 重置导航状态缓存为 UNKNOWN（防止旧状态干扰新目标点判断）
+  cached_nav_status_[robot_id].data = 0;  // 0 = UNKNOWN
+  RCLCPP_INFO(this->get_logger(), 
+              "   🔄 Reset nav status cache to UNKNOWN");
+
+  // 缓存目标点，用于重传
+  {
+    std::lock_guard<std::mutex> lock(waypoint_mutex_[robot_id]);
+    cached_waypoints_[robot_id].waypoint = msg;
+    cached_waypoints_[robot_id].retry_count = 0;
+    cached_waypoints_[robot_id].has_waypoint = true;
+    cached_waypoints_[robot_id].last_send_time = std::chrono::steady_clock::now();
+  }
+
+  // 立即发送一次
   std::vector<uint8_t> data_buffer =
     SerializeMsg<geometry_msgs::msg::PointStamped>(msg);
   SendBuffer prepare_buffer = {robot_id, data_buffer, 0};
   PrepareBuffer(prepare_buffer);
   
-  RCLCPP_INFO(this->get_logger(), "Waypoint for robot_%d queued (buffer size: %zu bytes)", 
-              robot_id, data_buffer.size());
+  RCLCPP_INFO(this->get_logger(), 
+              "   ✅ Waypoint sent (size: %zu bytes, will retry up to %d times if needed)", 
+              data_buffer.size(), MAX_WAYPOINT_RETRY);
+  RCLCPP_INFO(this->get_logger(), 
+              "========================================");
 }
 
 void RobotCommunicationNode::NetworkSendThread() {
   while (rclcpp::ok()) {
-    if (send_buffer_queue.empty()) {
+    SendBuffer s_buffer;
+    {
+      std::lock_guard<std::mutex> lock(send_buffer_mutex_);
+      if (send_buffer_queue.empty()) {
+        // 在锁外 sleep 以避免长时间持有锁
+      } else {
+        s_buffer = send_buffer_queue.front();
+        send_buffer_queue.pop();
+      }
+    }
+    
+    // 如果队列为空（id为-1表示没有取到数据），则短暂sleep
+    if (s_buffer.id == -1) {
       std::this_thread::sleep_for(std::chrono::nanoseconds(10));
       continue;
     }
-    SendBuffer s_buffer = send_buffer_queue.front();
-    send_buffer_queue.pop();
     if (saved_client_addr[s_buffer.id].sin_addr.s_addr == 0) {
       RCLCPP_WARN(this->get_logger(), "No saved address for robot_%d, skipping send", s_buffer.id);
       continue;
@@ -219,11 +272,47 @@ void RobotCommunicationNode::NetworkRecvThread() {
 
     uint8_t id;
     std::memcpy(&id, buffer_tmp.data(), sizeof(id));
-    saved_client_addr[id] = client_addr;
-    if (recv_buffer_queue[id].size() >= MAX_BUFFER_QUEUE_SIZE) {
-      continue;
+    
+    // 检查地址是否发生变化并记录
+    if (saved_client_addr[id].sin_addr.s_addr != 0) {
+      // 已有地址，检查是否变化
+      if (saved_client_addr[id].sin_addr.s_addr != client_addr.sin_addr.s_addr ||
+          saved_client_addr[id].sin_port != client_addr.sin_port) {
+        
+        // 记录地址变化
+        char old_addr_str[INET_ADDRSTRLEN];
+        char new_addr_str[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &(saved_client_addr[id].sin_addr), old_addr_str, INET_ADDRSTRLEN);
+        inet_ntop(AF_INET, &(client_addr.sin_addr), new_addr_str, INET_ADDRSTRLEN);
+        uint16_t old_port = ntohs(saved_client_addr[id].sin_port);
+        uint16_t new_port = ntohs(client_addr.sin_port);
+        
+        RCLCPP_WARN(this->get_logger(), 
+                    "Robot_%u address changed: %s:%u -> %s:%u",
+                    id, old_addr_str, old_port, new_addr_str, new_port);
+      }
+    } else {
+      // 第一次接收到该机器人的消息
+      char addr_str[INET_ADDRSTRLEN];
+      inet_ntop(AF_INET, &(client_addr.sin_addr), addr_str, INET_ADDRSTRLEN);
+      uint16_t port = ntohs(client_addr.sin_port);
+      
+      RCLCPP_INFO(this->get_logger(), 
+                  "Robot_%u connected from %s:%u",
+                  id, addr_str, port);
     }
-    recv_buffer_queue[id].push(buffer_tmp);
+    
+    // 始终更新为最新地址
+    saved_client_addr[id] = client_addr;
+    
+    // 使用互斥锁保护接收队列
+    {
+      std::lock_guard<std::mutex> lock(recv_buffer_mutex_[id]);
+      if (recv_buffer_queue[id].size() >= MAX_BUFFER_QUEUE_SIZE) {
+        continue;
+      }
+      recv_buffer_queue[id].push(buffer_tmp);
+    }
   }
 }
 
@@ -250,7 +339,12 @@ void RobotCommunicationNode::PrepareBuffer(const SendBuffer &prepare_buffer) {
     SendBuffer s_buffer;
     s_buffer.buffer = packet;
     s_buffer.id = prepare_buffer.id;
-    send_buffer_queue.push(s_buffer);
+    
+    // 使用互斥锁保护队列操作
+    {
+      std::lock_guard<std::mutex> lock(send_buffer_mutex_);
+      send_buffer_queue.push(s_buffer);
+    }
   }
 }
 
@@ -262,12 +356,22 @@ void RobotCommunicationNode::ParseBufferThread(const int robot_id) {
   rclcpp::Time last_transform_log_time(0, 0, RCL_ROS_TIME); // Track last transform log time
 
   while (rclcpp::ok()) {
-    if (recv_buffer_queue[robot_id].empty()) {
+    std::vector<uint8_t> buffer_tmp;
+    {
+      std::lock_guard<std::mutex> lock(recv_buffer_mutex_[robot_id]);
+      if (recv_buffer_queue[robot_id].empty()) {
+        // 在锁外 sleep 以避免长时间持有锁
+      } else {
+        buffer_tmp = recv_buffer_queue[robot_id].front();
+        recv_buffer_queue[robot_id].pop();
+      }
+    }
+    
+    // 如果队列为空，则短暂sleep
+    if (buffer_tmp.empty()) {
       std::this_thread::sleep_for(std::chrono::nanoseconds(10));
       continue;
     }
-    std::vector<uint8_t> buffer_tmp = recv_buffer_queue[robot_id].front();
-    recv_buffer_queue[robot_id].pop();
 
     uint8_t id, type, max_idx;
     uint16_t idx;
@@ -389,7 +493,7 @@ void RobotCommunicationNode::ParseBufferThread(const int robot_id) {
             
             // 降低日志输出频率到 0.5Hz（2秒间隔）
             if ((now - last_transform_log_time).seconds() >= 2.0) {
-              RCLCPP_INFO(this->get_logger(),
+              RCLCPP_DEBUG(this->get_logger(),
                           "Sent transform (robot id=%u) parent='%s' child='%s' time=%u.%u",
                           id,
                           transformStamped.header.frame_id.c_str(),
@@ -464,7 +568,7 @@ void RobotCommunicationNode::ParseBufferThread(const int robot_id) {
             data_idx += 5;
           }
           
-          RCLCPP_INFO(this->get_logger(), 
+          RCLCPP_DEBUG(this->get_logger(), 
                       "Applied %d delta changes to robot_%u map (expected %d)",
                       changes_applied, id, num_changes);
           
@@ -474,7 +578,7 @@ void RobotCommunicationNode::ParseBufferThread(const int robot_id) {
           
         } else {
           // 这是完整地图
-          RCLCPP_INFO(this->get_logger(), 
+          RCLCPP_DEBUG(this->get_logger(), 
                       "Received and published full map for robot_%u (size: %dx%d)",
                       id, map.info.width, map.info.height);
           
@@ -514,6 +618,24 @@ void RobotCommunicationNode::ParseBufferThread(const int robot_id) {
                       "Updated cached status for robot_%u: %s (%d)",
                       id, status_names[status], status);
         }
+        
+        // 如果状态变为 ACCEPTED、EXECUTING 或 ABORTED，说明目标点已被接收，清除缓存的重传任务
+        // ACCEPTED=1: 目标已接受
+        // EXECUTING=2: 正在执行
+        // ABORTED=6: 已中止（说明收到了目标但执行失败）
+        if (status == 1 || status == 2 || status == 6) {
+          std::lock_guard<std::mutex> lock(waypoint_mutex_[id]);
+          if (cached_waypoints_[id].has_waypoint) {
+            // 记录之前缓存的目标点坐标
+            const auto& wp = cached_waypoints_[id].waypoint;
+            RCLCPP_INFO(this->get_logger(), 
+                        "✅ Robot_%u acknowledged waypoint (%.2f, %.2f, %.2f) due to status=%s, "
+                        "stopping retries (retry_count=%u)",
+                        id, wp.point.x, wp.point.y, wp.point.z,
+                        status_names[status], cached_waypoints_[id].retry_count);
+            cached_waypoints_[id].has_waypoint = false;  // 停止重传
+          }
+        }
       } else if (type == 6) {  // Nav2 Path
         nav_msgs::msg::Path nav2_path =
           DeserializeMsg<nav_msgs::msg::Path>(buffer);
@@ -533,7 +655,7 @@ void RobotCommunicationNode::ParseBufferThread(const int robot_id) {
         }
         
         nav2_path_pub_[id]->publish(nav2_path);
-        RCLCPP_INFO(this->get_logger(), 
+        RCLCPP_DEBUG(this->get_logger(), 
                     "Received and published Nav2 path for robot_%u (%zu poses)",
                     id, nav2_path.poses.size());
       }
@@ -582,6 +704,84 @@ T RobotCommunicationNode::DeserializeMsg(const std::vector<uint8_t> &data) {
 void RobotCommunicationNode::PublishCachedStatusCallback() {
   for (int i = 1; i <= robot_count; i++) {
     nav2_status_pub_[i]->publish(cached_nav_status_[i]);
+  }
+}
+
+// 目标点重传回调
+void RobotCommunicationNode::WaypointResendCallback() {
+  auto now = std::chrono::steady_clock::now();
+  
+  // 收集需要重传的目标点
+  std::vector<std::pair<int, geometry_msgs::msg::PointStamped>> waypoints_to_send;
+  
+  for (int i = 1; i <= robot_count; i++) {
+    std::lock_guard<std::mutex> lock(waypoint_mutex_[i]);
+    
+    // 检查是否有待发送的目标点
+    if (!cached_waypoints_[i].has_waypoint) {
+      continue;
+    }
+    
+    // 检查是否超过最大重传次数
+    if (cached_waypoints_[i].retry_count >= MAX_WAYPOINT_RETRY) {
+      RCLCPP_WARN(this->get_logger(), 
+                  "Waypoint for robot_%d reached max retries (%d), giving up. Point: (%.2f, %.2f, %.2f)",
+                  i, MAX_WAYPOINT_RETRY,
+                  cached_waypoints_[i].waypoint.point.x,
+                  cached_waypoints_[i].waypoint.point.y,
+                  cached_waypoints_[i].waypoint.point.z);
+      cached_waypoints_[i].has_waypoint = false;  // 放弃重传
+      continue;
+    }
+    
+    // 检查是否到了重传时间
+    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+      now - cached_waypoints_[i].last_send_time
+    ).count();
+    
+    if (elapsed < WAYPOINT_RESEND_INTERVAL_MS) {
+      continue;  // 还没到重传时间
+    }
+    
+    // 检查客户端地址是否可用
+    if (saved_client_addr[i].sin_addr.s_addr == 0) {
+      RCLCPP_DEBUG(this->get_logger(), "No saved address for robot_%d, skipping waypoint resend", i);
+      continue;
+    }
+    
+    // 只有retry_count > 0时才是重传（第一次发送在WayPointCallBack中完成）
+    if (cached_waypoints_[i].retry_count > 0) {
+      // 收集需要发送的目标点
+      waypoints_to_send.push_back({i, cached_waypoints_[i].waypoint});
+      
+      RCLCPP_INFO(this->get_logger(), 
+                  "🔄 Resending waypoint to robot_%d (retry %d/%d): (%.2f, %.2f, %.2f)",
+                  i, cached_waypoints_[i].retry_count, MAX_WAYPOINT_RETRY,
+                  cached_waypoints_[i].waypoint.point.x,
+                  cached_waypoints_[i].waypoint.point.y,
+                  cached_waypoints_[i].waypoint.point.z);
+    }
+    
+    // 更新重传状态
+    cached_waypoints_[i].retry_count++;
+    cached_waypoints_[i].last_send_time = now;
+  }
+  
+  // 在锁外发送（避免死锁）
+  for (const auto& [robot_id, waypoint] : waypoints_to_send) {
+    if (saved_client_addr[robot_id].sin_addr.s_addr != 0) {
+      std::vector<uint8_t> data_buffer =
+        SerializeMsg<geometry_msgs::msg::PointStamped>(waypoint);
+      SendBuffer prepare_buffer = {robot_id, data_buffer, 0};
+      PrepareBuffer(prepare_buffer);
+      
+      char addr_str[INET_ADDRSTRLEN];
+      inet_ntop(AF_INET, &(saved_client_addr[robot_id].sin_addr), addr_str, INET_ADDRSTRLEN);
+      uint16_t target_port = ntohs(saved_client_addr[robot_id].sin_port);
+      RCLCPP_INFO(this->get_logger(), 
+                  "   📤 Waypoint resent to %s:%u (size: %zu bytes)",
+                  addr_str, target_port, data_buffer.size());
+    }
   }
 }
 

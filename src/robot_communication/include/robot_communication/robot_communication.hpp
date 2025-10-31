@@ -15,6 +15,8 @@
 #include <tf2_ros/transform_broadcaster.h>  // 添加：TransformBroadcaster 声明
 #include <pcl/impl/point_types.hpp>
 #include <queue>
+#include <mutex>  // 添加：互斥锁保护
+#include <chrono>  // 添加：时间点支持
 #include <rclcpp/node.hpp>
 #include <rclcpp/node_options.hpp>
 #include <rclcpp/qos_event.hpp>
@@ -61,7 +63,9 @@ class RobotCommunicationNode : public rclcpp::Node {
     int msg_type = -1;
   };
   std::queue<SendBuffer> send_buffer_queue;
+  std::mutex send_buffer_mutex_;  // 保护 send_buffer_queue 的互斥锁
   std::queue<std::vector<uint8_t>> recv_buffer_queue[MAX_ROBOT_COUNT];
+  std::mutex recv_buffer_mutex_[MAX_ROBOT_COUNT];  // 保护每个 recv_buffer_queue 的互斥锁
 
   void InitServer();
 
@@ -106,6 +110,20 @@ class RobotCommunicationNode : public rclcpp::Node {
   std_msgs::msg::Int8 cached_nav_status_[MAX_ROBOT_COUNT];     // 缓存的导航状态
   rclcpp::TimerBase::SharedPtr status_publish_timer_;          // 定时发布器
   void PublishCachedStatusCallback();                          // 定时发布回调
+  
+  // 目标点可靠传输：缓存和重传机制
+  struct WaypointCache {
+    geometry_msgs::msg::PointStamped waypoint;
+    int retry_count = 0;
+    bool has_waypoint = false;
+    std::chrono::steady_clock::time_point last_send_time;
+  };
+  WaypointCache cached_waypoints_[MAX_ROBOT_COUNT];            // 缓存的目标点
+  std::mutex waypoint_mutex_[MAX_ROBOT_COUNT];                 // 保护目标点缓存
+  rclcpp::TimerBase::SharedPtr waypoint_resend_timer_;         // 重传定时器
+  void WaypointResendCallback();                               // 重传回调
+  static constexpr int MAX_WAYPOINT_RETRY = 10;                // 最大重传次数
+  static constexpr int WAYPOINT_RESEND_INTERVAL_MS = 500;      // 重传间隔（毫秒）
 };
 }  // namespace robot_communication
 
