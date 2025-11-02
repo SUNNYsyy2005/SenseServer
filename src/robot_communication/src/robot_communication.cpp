@@ -524,11 +524,18 @@ void RobotCommunicationNode::ParseBufferThread(const int robot_id) {
           map.header.frame_id = prefix + map.header.frame_id;
         }
         
-        // 检查是否为增量地图（width的最高位为1表示这是负数，即增量地图）
-        int32_t signed_width = static_cast<int32_t>(map.info.width);
-        if (signed_width < 0) {
+        // 检查是否为增量地图（width最高位为1表示这是负数，即增量地图）
+        // uint32_t 的最高位为1时，重新解释为 int32_t 就是负数
+        bool is_delta_map = (map.info.width & 0x80000000) != 0;
+        
+        if (is_delta_map) {
           // 这是增量地图
+          int32_t signed_width = *reinterpret_cast<int32_t*>(&map.info.width);
           int32_t num_changes = -signed_width;
+          
+          RCLCPP_DEBUG(this->get_logger(), 
+                      "Detected delta map for robot_%u with %d changes (raw width=0x%08X)",
+                      id, num_changes, map.info.width);
           
           if (!map_initialized_[id]) {
             RCLCPP_WARN(this->get_logger(), 
@@ -569,8 +576,9 @@ void RobotCommunicationNode::ParseBufferThread(const int robot_id) {
           }
           
           RCLCPP_DEBUG(this->get_logger(), 
-                      "Applied %d delta changes to robot_%u map (expected %d)",
-                      changes_applied, id, num_changes);
+                      "Applied %d delta changes to robot_%u map (expected %d, size: %ux%u)",
+                      changes_applied, id, num_changes, 
+                      updated_map.info.width, updated_map.info.height);
           
           // 更新缓存并发布
           cached_maps_[id] = updated_map;
@@ -579,7 +587,7 @@ void RobotCommunicationNode::ParseBufferThread(const int robot_id) {
         } else {
           // 这是完整地图
           RCLCPP_DEBUG(this->get_logger(), 
-                      "Received and published full map for robot_%u (size: %dx%d)",
+                      "Received and published full map for robot_%u (size: %ux%u)",
                       id, map.info.width, map.info.height);
           
           cached_maps_[id] = map;

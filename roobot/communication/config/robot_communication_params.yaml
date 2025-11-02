@@ -1,0 +1,12 @@
+robot_communication:
+  ros__parameters:
+    network_ip: "127.0.0.1"
+    network_port: 12130
+    map_send_interval: 0.5       # 增量地图发送间隔（秒），保持实时性
+    full_map_send_interval: 10.0 # 完整地图发送间隔（秒），确保可靠性
+    multi_positionX: 0.0
+    multi_positionY: 0.0
+    multi_positionZ: 0.0
+    multi_rotateR: 0.0
+    multi_rotateP: 0.0
+    multi_rotateY: 0.0
